@@ -130,7 +130,7 @@ type change struct {
 func (s *Server) act(ctx context.Context, who caller, c change) Result {
 	r := s.act1(ctx, who, c)
 	s.Log.Info("change", "by", who.name, "investigation", c.inv, "action", c.Action, "namespace", c.Namespace, "kind", c.Kind, "name", c.Name,
-		"result", r.Result, "why", r.Why, "reason", c.why)
+		"why", c.why, "result", r.Result, "detail", r.Why)
 	return r
 }
 
