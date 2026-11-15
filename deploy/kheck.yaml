@@ -1,0 +1,114 @@
+# kheck in its own namespace. Its ServiceAccount is the only one agents need
+# that can change anything; policy.yaml limits it further.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kheck
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kheck
+  namespace: kheck
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kheck
+rules:
+  # What the checks read.
+  - apiGroups: [""]
+    resources: [nodes, namespaces, pods, events]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [get]
+  # The changes.
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kheck
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kheck
+subjects:
+  - kind: ServiceAccount
+    name: kheck
+    namespace: kheck
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kheck
+  namespace: kheck
+data:
+  config.yaml: |
+    tremolo:
+      url: http://tremolo.tremolo.svc
+    protect:
+      namespaces: [kube-system, kube-public, kube-node-lease, flux-system, kheck]
+    gates:
+      - name: one node at a time
+        actions: [cordon]
+        require: {controlPlane: false, otherNodesReady: true, maxCordoned: 0}
+      - name: replicas
+        actions: [scale]
+        require: {minReplicas: 1, maxReplicas: 10}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kheck
+  namespace: kheck
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kheck}
+  template:
+    metadata:
+      labels: {app: kheck}
+    spec:
+      serviceAccountName: kheck
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: kheck
+          image: ghcr.io/tpural/kheck:latest
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts: [{name: config, mountPath: /etc/kheck}]
+      volumes:
+        - name: config
+          configMap: {name: kheck}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kheck
+  namespace: kheck
+spec:
+  selector: {app: kheck}
+  ports: [{name: http, port: 8080, targetPort: http}]
