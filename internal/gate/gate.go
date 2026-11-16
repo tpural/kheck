@@ -20,9 +20,9 @@ type Change struct {
 	Replicas int32
 }
 
-// Querier runs PromQL as the caller.
+// Querier runs PromQL.
 type Querier interface {
-	Query(ctx context.Context, token, promql string) ([]float64, error)
+	Query(ctx context.Context, promql string) ([]float64, error)
 }
 
 // Gates check changes against the config's gates.
@@ -35,7 +35,7 @@ type Gates struct {
 
 // Check says which gate refuses a change and why, or "" when all pass. An
 // error is a gate it couldn't check, which refuses too.
-func (g *Gates) Check(ctx context.Context, token string, c Change) (string, error) {
+func (g *Gates) Check(ctx context.Context, c Change) (string, error) {
 	var nodes []kube.Node
 	for _, gt := range g.Gates {
 		if !applies(gt, c) {
@@ -48,7 +48,7 @@ func (g *Gates) Check(ctx context.Context, token string, c Change) (string, erro
 				return "", fmt.Errorf("gate %q: %w", gt.Name, err)
 			}
 		}
-		why, err := g.check(ctx, token, r, c, nodes)
+		why, err := g.check(ctx, r, c, nodes)
 		if err != nil {
 			return "", fmt.Errorf("gate %q: %w", gt.Name, err)
 		}
@@ -69,7 +69,7 @@ func applies(g config.Gate, c Change) bool {
 	return true
 }
 
-func (g *Gates) check(ctx context.Context, token string, r config.Require, c Change, nodes []kube.Node) (string, error) {
+func (g *Gates) check(ctx context.Context, r config.Require, c Change, nodes []kube.Node) (string, error) {
 	node := c.Kind == "node"
 	if r.ControlPlane != nil && node {
 		i := slices.IndexFunc(nodes, func(n kube.Node) bool { return n.Name == c.Name })
@@ -117,7 +117,7 @@ func (g *Gates) check(ctx context.Context, token string, r config.Require, c Cha
 		} else {
 			q = strings.NewReplacer("$NAMESPACE", c.Namespace, "$NAME", c.Name).Replace(q)
 		}
-		vs, err := g.Metrics.Query(ctx, token, q)
+		vs, err := g.Metrics.Query(ctx, q)
 		if err != nil {
 			return "", fmt.Errorf("query %s: %w", q, err)
 		}

@@ -1,5 +1,5 @@
-// Package config is kheck's configuration: where tremolo is, what may never
-// be changed, and the gates a change must pass.
+// Package config is kheck's configuration: who may ask for changes, what may
+// never be changed, and the gates a change must pass.
 package config
 
 import (
@@ -17,8 +17,14 @@ var Actions = []string{"restart", "delete_pod", "scale", "cordon", "uncordon"}
 
 // Config is kheck's configuration.
 type Config struct {
-	Listen  string  `json:"listen"`
-	Tremolo Tremolo `json:"tremolo"`
+	Listen string `json:"listen"`
+	// Callers are the Kubernetes users (names or globs, e.g.
+	// system:serviceaccount:agents:*) that may ask for changes.
+	Callers []string `json:"callers"`
+	// Audiences a caller's token must be for. A token made for kheck can't
+	// be used against the API server, and kheck can't replay it there.
+	Audiences []string `json:"audiences"`
+	Metrics   Metrics  `json:"metrics,omitzero"`
 	// Settle is how long a change waits for its workload to be ready again.
 	Settle  Duration `json:"settle"`
 	Protect Protect  `json:"protect"`
@@ -28,8 +34,8 @@ type Config struct {
 	Gates        []Gate   `json:"gates"`
 }
 
-// Tremolo is where actions are recorded, and where callers' tokens are checked.
-type Tremolo struct {
+// Metrics is a Prometheus-compatible API, for query gates.
+type Metrics struct {
 	URL string `json:"url"`
 }
 
@@ -64,7 +70,7 @@ type Require struct {
 	// MinReplicas and MaxReplicas bound what scale may set.
 	MinReplicas *int `json:"minReplicas,omitempty"`
 	MaxReplicas *int `json:"maxReplicas,omitempty"`
-	// Query is PromQL, run in tremolo as the caller, that must return
+	// Query is PromQL, run against metrics.url, that must return
 	// something, and nothing zero. $NAMESPACE, $NAME and $NODE are
 	// replaced with the change's target.
 	Query string `json:"query,omitempty"`
@@ -102,8 +108,16 @@ func Parse(b []byte) (*Config, error) {
 	if c.Protect.Label == "" {
 		c.Protect.Label = "kheck/protected"
 	}
-	if c.Tremolo.URL == "" {
-		return nil, errors.New("tremolo.url is required: every change is recorded there")
+	if len(c.Audiences) == 0 {
+		c.Audiences = []string{"kheck"}
+	}
+	if len(c.Callers) == 0 {
+		return nil, errors.New("callers is required: the Kubernetes users that may ask for changes")
+	}
+	for _, p := range c.Callers {
+		if _, err := path.Match(p, ""); err != nil {
+			return nil, fmt.Errorf("callers: %q: %w", p, err)
+		}
 	}
 	for _, p := range c.Protect.Namespaces {
 		if _, err := path.Match(p, ""); err != nil {
@@ -123,6 +137,9 @@ func Parse(b []byte) (*Config, error) {
 			if _, err := path.Match(p, ""); err != nil {
 				return nil, fmt.Errorf("gate %q: namespaces: %q: %w", g.Name, p, err)
 			}
+		}
+		if g.Require.Query != "" && c.Metrics.URL == "" {
+			return nil, fmt.Errorf("gate %q: a query needs metrics.url", g.Name)
 		}
 		if r := g.Require; r.MinReplicas != nil && r.MaxReplicas != nil && *r.MinReplicas > *r.MaxReplicas {
 			return nil, fmt.Errorf("gate %q: minReplicas is more than maxReplicas", g.Name)

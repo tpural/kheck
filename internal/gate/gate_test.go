@@ -28,12 +28,7 @@ func node(name string, ready, cordoned bool, labels map[string]string, taints ..
 
 type metrics map[string][]float64
 
-func (m metrics) Query(_ context.Context, token, q string) ([]float64, error) {
-	if token != "tok" {
-		return nil, nil
-	}
-	return m[q], nil
-}
+func (m metrics) Query(_ context.Context, q string) ([]float64, error) { return m[q], nil }
 
 func TestCheck(t *testing.T) {
 	no, yes, zero := false, true, 0
@@ -43,10 +38,10 @@ func TestCheck(t *testing.T) {
 		node("cp1", true, false, cp),
 		node("w1", true, false, nil),
 		node("w2", true, false, nil),
-		node("gpu", false, true, nil, "possum.dev/asleep"), // asleep: neither down nor cordoned
+		node("gpu", false, true, nil, "example.com/asleep"), // asleep: neither down nor cordoned
 	)
 	g := &Gates{
-		Cluster: kube.New(k), AsleepTaints: []string{"possum.dev/asleep"},
+		Cluster: kube.New(k), AsleepTaints: []string{"example.com/asleep"},
 		Metrics: metrics{`quiet{namespace="ha"}`: {1}, `quiet{namespace="busy"}`: {0}},
 		Gates: []config.Gate{
 			{Name: "one node at a time", Actions: []string{"cordon"}, Require: config.Require{ControlPlane: &no, OtherNodesReady: &yes, MaxCordoned: &zero}},
@@ -69,14 +64,15 @@ func TestCheck(t *testing.T) {
 		{Change{Action: "restart", Namespace: "busy", Kind: "deployment", Name: "x"}, `gate "quiet": query quiet{namespace="busy"} isn't true`},
 		{Change{Action: "restart", Namespace: "other", Kind: "deployment", Name: "x"}, ""},
 	} {
-		got, err := g.Check(ctx, "tok", tc.c)
+		got, err := g.Check(ctx, tc.c)
 		if err != nil || !strings.Contains(got, tc.want) || (tc.want == "") != (got == "") {
 			t.Errorf("%+v: %q, %v; want %q", tc.c, got, err, tc.want)
 		}
 	}
 
-	// A query that finds nothing (here: another caller's token) refuses.
-	if got, _ := g.Check(ctx, "other", Change{Action: "restart", Namespace: "ha", Kind: "deployment", Name: "x"}); !strings.Contains(got, "found nothing") {
+	// A query that finds nothing refuses.
+	g.Metrics = metrics{}
+	if got, _ := g.Check(ctx, Change{Action: "restart", Namespace: "ha", Kind: "deployment", Name: "x"}); !strings.Contains(got, "found nothing") {
 		t.Errorf("got %q", got)
 	}
 
@@ -84,13 +80,13 @@ func TestCheck(t *testing.T) {
 	n, _ := k.CoreV1().Nodes().Get(ctx, "w2", metav1.GetOptions{})
 	n.Spec.Unschedulable = true
 	_, _ = k.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
-	if got, _ := g.Check(ctx, "tok", Change{Action: "cordon", Kind: "node", Name: "w1"}); !strings.Contains(got, "1 other nodes are already cordoned (w2)") {
+	if got, _ := g.Check(ctx, Change{Action: "cordon", Kind: "node", Name: "w1"}); !strings.Contains(got, "1 other nodes are already cordoned (w2)") {
 		t.Errorf("got %q", got)
 	}
 	n.Spec.Unschedulable = false
 	n.Status.Conditions[0].Status = corev1.ConditionFalse
 	_, _ = k.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
-	if got, _ := g.Check(ctx, "tok", Change{Action: "cordon", Kind: "node", Name: "w1"}); !strings.Contains(got, "not every other node is Ready: w2") {
+	if got, _ := g.Check(ctx, Change{Action: "cordon", Kind: "node", Name: "w1"}); !strings.Contains(got, "not every other node is Ready: w2") {
 		t.Errorf("got %q", got)
 	}
 }
