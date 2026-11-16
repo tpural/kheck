@@ -26,6 +26,10 @@ rules:
   - apiGroups: [apps]
     resources: [deployments, statefulsets, daemonsets]
     verbs: [get]
+  # Checking callers' tokens.
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
   # The changes.
   - apiGroups: [apps]
     resources: [deployments, statefulsets, daemonsets]
@@ -57,8 +61,8 @@ metadata:
   namespace: kheck
 data:
   config.yaml: |
-    tremolo:
-      url: http://tremolo.tremolo.svc
+    # The ServiceAccounts that may ask for changes.
+    callers: ["system:serviceaccount:agents:*"]
     protect:
       namespaces: [kube-system, kube-public, kube-node-lease, flux-system, kheck]
     gates:
@@ -90,6 +94,9 @@ spec:
         - name: kheck
           image: ghcr.io/tpural/kheck:latest
           ports: [{name: http, containerPort: 8080}]
+          # Every change is logged to stderr, and over OTLP when this is set.
+          # env:
+          #   - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: http://otel-collector.observability.svc:4318}
           readinessProbe:
             httpGet: {path: /healthz, port: http}
           securityContext:

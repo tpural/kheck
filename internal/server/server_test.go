@@ -3,69 +3,26 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	appsv1 "k8s.io/api/apps/v1"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/tpural/kheck/internal/config"
 	"github.com/tpural/kheck/internal/gate"
 	"github.com/tpural/kheck/internal/kube"
-	"github.com/tpural/kheck/internal/tremolo"
 )
-
-// fakeTremolo knows one token, and refuses actions while refusing is set.
-type fakeTremolo struct {
-	mu       sync.Mutex
-	did      []string
-	refusing bool
-}
-
-func (f *fakeTremolo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") != "Bearer good" {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, _ := io.ReadAll(r.Body)
-	switch {
-	case r.URL.Path == "/api/me":
-		_, _ = io.WriteString(w, `{"name":"tp","token":{"name":"upkeeper"}}`)
-	case strings.HasSuffix(r.URL.Path, "/actions") && f.refusing:
-		w.WriteHeader(http.StatusConflict)
-		_, _ = io.WriteString(w, `{"error":"agents are paused"}`)
-	case strings.HasSuffix(r.URL.Path, "/actions"):
-		var a tremolo.Action
-		_ = json.Unmarshal(b, &a)
-		f.did = append(f.did, "begin "+a.Action+" "+a.Target+" why "+a.Why)
-		_, _ = io.WriteString(w, `{"id":9}`)
-	case strings.Contains(r.URL.Path, "/actions/"):
-		f.did = append(f.did, "end "+strings.TrimSpace(string(b)))
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func (f *fakeTremolo) took() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	s := strings.Join(f.did, "; ")
-	f.did = nil
-	return s
-}
 
 type bearer struct {
 	token string
@@ -82,9 +39,6 @@ func one(n int32) *int32 { return &n }
 
 func TestServer(t *testing.T) {
 	ctx := context.Background()
-	ft := &fakeTremolo{}
-	ts := httptest.NewServer(ft)
-	defer ts.Close()
 	labels := map[string]string{"app": "api"}
 	dep := func(ns, name string, l map[string]string) *appsv1.Deployment {
 		return &appsv1.Deployment{
@@ -105,20 +59,29 @@ func TestServer(t *testing.T) {
 			Status:     corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "api", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}}}}},
 		},
 	)
-	cfg, err := config.Parse([]byte(fmt.Sprintf(`
-tremolo: {url: %s}
+	// The API server knows three tokens, one for another audience.
+	k.PrependReactor("create", "tokenreviews", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		r := a.(k8stesting.CreateAction).GetObject().(*authv1.TokenReview)
+		users := map[string]string{"good": "system:serviceaccount:agents:fixer", "stranger": "system:serviceaccount:default:x"}
+		if u, ok := users[r.Spec.Token]; ok && len(r.Spec.Audiences) == 1 && r.Spec.Audiences[0] == "kheck" {
+			r.Status = authv1.TokenReviewStatus{Authenticated: true, User: authv1.UserInfo{Username: u}}
+		}
+		return true, r, nil
+	})
+	var logs strings.Builder
+	cfg, err := config.Parse([]byte(`
+callers: ["system:serviceaccount:agents:*"]
 settle: 1s
 protect: {namespaces: [kube-system]}
 gates: [{name: replicas, actions: [scale], require: {minReplicas: 1}}]
-`, ts.URL)))
+`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cluster := kube.New(k)
-	tc := tremolo.New(ts.URL)
 	s := &Server{
-		Config: cfg, Cluster: cluster, Tremolo: tc, Log: slog.New(slog.DiscardHandler),
-		Gates: &gate.Gates{Gates: cfg.Gates, Cluster: cluster, Metrics: tc},
+		Config: cfg, Cluster: cluster, Log: slog.New(slog.NewJSONHandler(&logs, nil)),
+		Gates: &gate.Gates{Gates: cfg.Gates, Cluster: cluster},
 	}
 	hs := httptest.NewServer(s.Handler())
 	defer hs.Close()
@@ -127,9 +90,11 @@ gates: [{name: replicas, actions: [scale], require: {minReplicas: 1}}]
 		c := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil)
 		return c.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: hs.URL + "/mcp", HTTPClient: &http.Client{Transport: bearer{token, http.DefaultTransport}, Timeout: 10 * time.Second}}, nil)
 	}
-	// Only a token tremolo knows gets in.
-	if _, err := connect("bad"); err == nil {
-		t.Fatal("a token tremolo doesn't know connected")
+	// Only a valid token for kheck, of one of the callers, gets in.
+	for _, tok := range []string{"bad", "stranger"} {
+		if _, err := connect(tok); err == nil {
+			t.Fatalf("token %s connected", tok)
+		}
 	}
 	cs, err := connect("good")
 	if err != nil {
@@ -149,23 +114,26 @@ gates: [{name: replicas, actions: [scale], require: {minReplicas: 1}}]
 		return r
 	}
 	restart := func(ns, name string) map[string]any {
-		return map[string]any{"investigation": 3, "namespace": ns, "kind": "deployment", "name": name, "why": "wedged"}
+		return map[string]any{"ref": "INC-3", "namespace": ns, "kind": "deployment", "name": name, "why": "wedged"}
 	}
 
-	// A change that passes is recorded as the caller, made, and waited on.
+	// A change that passes is made, logged as the caller, and waited on.
 	r := call("restart", restart("app", "api"))
 	if r.Result != "done" || !r.Ready || !strings.Contains(r.Settled, "1/1 ready") {
 		t.Errorf("restart %+v", r)
 	}
-	if got, want := ft.took(), `begin rollout restart deployment/api why wedged; end {"result":"done"}`; got != want {
-		t.Errorf("tremolo got %q, want %q", got, want)
+	for _, want := range []string{`"msg":"change"`, `"by":"system:serviceaccount:agents:fixer"`, `"ref":"INC-3"`, `"action":"restart"`, `"why":"wedged"`, `"result":"done"`} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log has no %s: %s", want, logs.String())
+		}
 	}
 	d, _ := k.AppsV1().Deployments("app").Get(ctx, "api", metav1.GetOptions{})
 	if d.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] == "" {
 		t.Error("not restarted")
 	}
 
-	// Refusals never reach tremolo, let alone the cluster.
+	// Refusals never reach the cluster.
+	k.ClearActions()
 	for _, tc := range []struct {
 		tool string
 		args map[string]any
@@ -174,35 +142,25 @@ gates: [{name: replicas, actions: [scale], require: {minReplicas: 1}}]
 		{"restart", restart("kube-system", "coredns"), refused("namespace kube-system is protected")},
 		{"restart", restart("db", "postgres"), refused("namespace db has kheck/protected=true")},
 		{"restart", restart("app", "billing"), refused("deployment billing has kheck/protected=true")},
-		{"scale", map[string]any{"investigation": 3, "namespace": "app", "kind": "deployment", "name": "api", "replicas": 0, "why": "x"}, refused(`gate "replicas": 0 replicas is fewer than 1`)},
-		{"scale", map[string]any{"investigation": 3, "namespace": "app", "kind": "deployment", "name": "api", "replicas": 1, "why": "x"}, failed("it already wants 1; scaling isn't a way to restart")},
-		{"delete_pod", map[string]any{"investigation": 3, "namespace": "app", "name": "lone", "why": "x"}, failed("this pod has no controller, so it wouldn't come back")},
-		{"restart", map[string]any{"investigation": 3, "namespace": "app", "kind": "deployment", "name": "api", "why": " "}, failed("say why: what you found that this should fix")},
-		{"restart", map[string]any{"investigation": 3, "namespace": "app", "kind": "cronjob", "name": "api", "why": "x"}, failed("kind must be deployment, statefulset or daemonset")},
-		{"restart", map[string]any{"investigation": 3, "namespace": "App!", "kind": "deployment", "name": "api", "why": "x"}, failed("namespace and name must be Kubernetes names")},
+		{"scale", map[string]any{"ref": "INC-3", "namespace": "app", "kind": "deployment", "name": "api", "replicas": 0, "why": "x"}, refused(`gate "replicas": 0 replicas is fewer than 1`)},
+		{"scale", map[string]any{"ref": "INC-3", "namespace": "app", "kind": "deployment", "name": "api", "replicas": 1, "why": "x"}, failed("it already wants 1; scaling isn't a way to restart")},
+		{"delete_pod", map[string]any{"ref": "INC-3", "namespace": "app", "name": "lone", "why": "x"}, failed("this pod has no controller, so it wouldn't come back")},
+		{"restart", map[string]any{"ref": "INC-3", "namespace": "app", "kind": "deployment", "name": "api", "why": " "}, failed("say why: what you found that this should fix")},
+		{"restart", map[string]any{"ref": "INC-3", "namespace": "app", "kind": "cronjob", "name": "api", "why": "x"}, failed("kind must be deployment, statefulset or daemonset")},
+		{"restart", map[string]any{"ref": "INC-3", "namespace": "App!", "kind": "deployment", "name": "api", "why": "x"}, failed("namespace and name must be Kubernetes names")},
 	} {
 		if r := call(tc.tool, tc.args); r != tc.want {
 			t.Errorf("%s %v: %+v, want %+v", tc.tool, tc.args, r, tc.want)
 		}
 	}
-	if got := ft.took(); got != "" {
-		t.Errorf("refusals reached tremolo: %s", got)
+	for _, a := range k.Actions() {
+		if a.GetVerb() == "patch" || a.GetVerb() == "delete" {
+			t.Errorf("a refusal changed the cluster: %v", a)
+		}
 	}
 
 	// A new pod can't fix a bad image.
-	if r := call("delete_pod", map[string]any{"investigation": 3, "namespace": "app", "name": "bad", "why": "x"}); r.Result != "failed" || !strings.Contains(r.Why, "a new pod can't fix this: bad: api is ImagePullBackOff") {
+	if r := call("delete_pod", map[string]any{"ref": "INC-3", "namespace": "app", "name": "bad", "why": "x"}); r.Result != "failed" || !strings.Contains(r.Why, "a new pod can't fix this: bad: api is ImagePullBackOff") {
 		t.Errorf("delete_pod %+v", r)
-	}
-
-	// tremolo refusing (paused, over budget) stops it before the cluster.
-	ft.refusing = true
-	k.ClearActions()
-	if r := call("restart", restart("app", "api")); r.Result != "refused" || !strings.Contains(r.Why, "tremolo: 409: agents are paused") {
-		t.Errorf("restart while paused %+v", r)
-	}
-	for _, a := range k.Actions() {
-		if a.GetVerb() == "patch" {
-			t.Errorf("changed the cluster while tremolo refused: %v", a)
-		}
 	}
 }

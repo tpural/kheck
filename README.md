@@ -1,9 +1,8 @@
 # kheck
 
 kheck is an MCP server in front of the Kubernetes API, and the only way agents change the cluster. An agent
-asks it to restart, delete a pod, scale or cordon. kheck checks the change against rules you write, records it
-in [tremolo](https://github.com/tpural/tremolo) as the agent that asked, makes it, and waits for the workload
-to come back.
+asks it to restart, delete a pod, scale or cordon. kheck checks the change against rules you write, makes it,
+logs it as the agent that asked (to stderr and over OpenTelemetry), and waits for the workload to come back.
 
 Agents get no Kubernetes write access of their own. Whatever an agent's model decides, and whatever bugs its
 harness has, the cluster only changes in the ways kheck allows. And kheck's own ServiceAccount is limited
@@ -11,19 +10,19 @@ again by the API server (see [deploy/policy.yaml](deploy/policy.yaml)), in case 
 
 ## How a change goes
 
-1. **Who's asking.** The agent connects with its tremolo token. kheck asks tremolo who that is, and acts as
-   them: tremolo's scopes, budgets, pause and audit log apply to the agent, and kheck keeps no tokens.
+1. **Who's asking.** The agent connects with a Kubernetes ServiceAccount token made for kheck (audience
+   `kheck`). kheck checks it with the API server (a TokenReview), and only `callers` get in. A token for
+   kheck can't be used against the API server, so kheck can't replay it there either.
 2. **Protected?** Nothing in a protected namespace, and nothing labelled `kheck/protected=true` (on the
    namespace, the workload, the pod's owner or the node), is ever changed.
 3. **The gates.** Each gate that applies must pass: see below.
 4. **Can it work?** A new pod can't fix a bad image or config, its own memory limit, the wrong CPU
    architecture, a failing liveness probe or a pod that can't be scheduled; a pod without a controller
    wouldn't come back; scaling to the count it already has isn't a restart. These are refused as `failed`.
-5. **tremolo.** The action is recorded on the investigation before it's made. tremolo may refuse it: paused,
-   over a budget, a protected host.
-6. **The change**, then its result is recorded, and kheck waits up to `settle` for the workload to be ready.
+5. **The change**, then a `change` log record with who asked, why, the target and how it went. kheck waits
+   up to `settle` for the workload to be ready.
 
-Anything kheck can't check (tremolo down, a query that errors) refuses the change. Every tool answers with:
+Anything kheck can't check (the API server or metrics down, a query that errors) refuses the change. Every tool answers with:
 
 ```json
 {"result": "done", "settled": "deployment app/api has 2/2 ready after 14s.", "ready": true}
@@ -38,20 +37,23 @@ done as asked.
 
 | Tool | Arguments | Does |
 |---|---|---|
-| `restart` | investigation, namespace, kind (deployment, statefulset, daemonset), name, why | `kubectl rollout restart` |
-| `delete_pod` | investigation, namespace, name, why | deletes one pod for its controller to replace |
-| `scale` | investigation, namespace, kind (deployment, statefulset), name, replicas, why | sets replicas |
-| `cordon`, `uncordon` | investigation, node, why | marks a node (un)schedulable; nothing is evicted |
+| `restart` | ref, namespace, kind (deployment, statefulset, daemonset), name, why | `kubectl rollout restart` |
+| `delete_pod` | ref, namespace, name, why | deletes one pod for its controller to replace |
+| `scale` | ref, namespace, kind (deployment, statefulset), name, replicas, why | sets replicas |
+| `cordon`, `uncordon` | ref, node, why | marks a node (un)schedulable; nothing is evicted |
 | `gates` | | what's protected, and the gates |
 
-Every change is for a tremolo investigation, and says why.
+Every change says why. `ref` is optional: what it's for, such as an incident or ticket, logged with it.
+To pause agents, hold changes for a person or budget them, put that in the agent's harness, in front of kheck.
 
 ## Configuration
 
 ```yaml
 listen: ":8080"
-tremolo:
-  url: http://tremolo.tremolo.svc
+callers: ["system:serviceaccount:agents:*"] # Kubernetes users that may ask, names or globs
+audiences: [kheck]             # a caller's token must be for one of these
+metrics:
+  url: http://prometheus.monitoring.svc:9090 # any Prometheus-compatible API, for query gates
 settle: 90s                    # how long a change waits for its workload to be ready
 protect:
   namespaces: [kube-system, flux-system, "cert-*"]
@@ -71,7 +73,7 @@ gates:
     actions: [restart, delete_pod]
     namespaces: [home-assistant]
     require:
-      # PromQL, run in tremolo as the agent: it must return something, and nothing zero.
+      # PromQL against metrics.url: it must return something, and nothing zero.
       query: 'sum(rate(http_server_request_duration_seconds_count{k8s_namespace_name="$NAMESPACE"}[5m])) < 1'
 ```
 
@@ -94,5 +96,27 @@ restart and scale (1–10) workloads without changing what they run, delete pods
 cordon nodes other than control planes, and nothing in a protected namespace or labelled `kheck/protected`.
 Keep its namespace list in step with `protect.namespaces`.
 
-An agent's tremolo token needs `investigate`, and read access to metrics for `query` gates. Point the agent's
-MCP client at `http://kheck.kheck.svc:8080/mcp` with `Authorization: Bearer <token>`.
+Give the agent a token for kheck with a projected ServiceAccount token, and point its MCP client at
+`http://kheck.kheck.svc:8080/mcp` with `Authorization: Bearer <token>`, read from the file each time it
+connects (the kubelet rotates it):
+
+```yaml
+volumes:
+  - name: kheck-token
+    projected:
+      sources:
+        - serviceAccountToken: {audience: kheck, path: token, expirationSeconds: 3600}
+```
+
+## Logs
+
+Every change, refused or made, is a `change` record:
+
+```json
+{"msg":"change","by":"system:serviceaccount:agents:fixer","ref":"INC-3","action":"restart","namespace":"app",
+ "kind":"deployment","name":"api","why":"workers deadlocked","result":"done","detail":""}
+```
+
+They go to stderr as JSON, and over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` (or
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`) is set. The other standard `OTEL_*` variables apply, such as
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_RESOURCE_ATTRIBUTES`; the service name is `kheck`.

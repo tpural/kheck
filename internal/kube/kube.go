@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -430,4 +431,19 @@ func clip(s string, n int) string {
 		return s[:n] + "…"
 	}
 	return s
+}
+
+// Who checks a token with the API server, and returns its user, or "" when
+// the token isn't valid for one of the audiences.
+func (c *Cluster) Who(ctx context.Context, token string, audiences []string) (string, error) {
+	r, err := c.K.AuthenticationV1().TokenReviews().Create(ctx, &authv1.TokenReview{
+		Spec: authv1.TokenReviewSpec{Token: token, Audiences: audiences},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	if !r.Status.Authenticated {
+		return "", nil
+	}
+	return r.Status.User.Username, nil
 }
